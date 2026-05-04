@@ -1,0 +1,1331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aquascreen</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; cursor: none; }
+  canvas { display: block; position: absolute; top: 0; left: 0; width: 100%; height: 100%; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+const params = new URLSearchParams(location.search);
+const SEED = params.get('seed') ? parseInt(params.get('seed')) : Math.floor(Date.now() / 1000);
+const CONFIG = {
+  bg: params.get('bg') || 'tropical',
+  density: params.get('density') || 'medium',
+  palette: params.get('palette') || 'vibrant',
+  species: params.get('species') || 'all',
+  pixelScale: parseInt(params.get('pixelScale')) || 2,
+  speed: params.get('speed') || 'normal',
+  fps: parseInt(params.get('fps')) || 60,
+};
+
+const FISH_COUNTS = { low: 8, medium: 15, high: 25 };
+const SPEED_FACTORS = { slow: 0.6, normal: 1.0, fast: 1.5 };
+document.title = `Aquascreen (seed: ${SEED})`;
+const FISH_COUNT = FISH_COUNTS[CONFIG.density] || 15;
+const SPEED_FACTOR = SPEED_FACTORS[CONFIG.speed] || 1.0;
+const TARGET_FPS = CONFIG.fps;
+const FRAME_TIME = 1000 / TARGET_FPS;
+
+if (params.has('help')) {
+  const div = document.createElement('div');
+  div.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.9);color:#fff;padding:20px;font:14px monospace;z-index:999;border:2px solid #444;border-radius:8px;max-width:500px;';
+  div.innerHTML = '<h2>Aquascreen Parameters</h2><table>' +
+    [['bg', 'tropical, deep, green, oled', 'tropical'],
+     ['density', 'low, medium, high', 'medium'],
+     ['palette', 'vibrant, natural, pastel, neon', 'vibrant'],
+     ['species', 'comma-separated, or "all"', 'all'],
+     ['pixelScale', '1, 2, 3, 4', '2'],
+     ['speed', 'slow, normal, fast', 'normal'],
+     ['fps', '30, 60', '60'],
+     ['seed', 'any integer', 'random']]
+    .map(([k,v,d]) => '<tr><td style="color:#0cf">?' + k + '=</td><td>' + v + '</td><td style="color:#888">default: ' + d + '</td></tr>').join('') +
+    '</table><p style="margin-top:12px;color:#888">Any input exits screensaver.</p>';
+  document.body.appendChild(div);
+}
+
+// ---- Utilities ----
+
+function mulberry32(a) {
+  return function() {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+const rand = mulberry32(SEED);
+
+function randRange(min, max) {
+  return min + rand() * (max - min);
+}
+
+function randInt(min, max) {
+  return Math.floor(randRange(min, max + 1));
+}
+
+function hslToRgb(h, s, l) {
+  h /= 360; s /= 100; l /= 100;
+  let r, g, b;
+  if (s === 0) {
+    r = g = b = l;
+  } else {
+    const hue2rgb = (p, q, t) => {
+      if (t < 0) t += 1;
+      if (t > 1) t -= 1;
+      if (t < 1/6) return p + (q - p) * 6 * t;
+      if (t < 1/2) return q;
+      if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+      return p;
+    };
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    r = hue2rgb(p, q, h + 1/3);
+    g = hue2rgb(p, q, h);
+    b = hue2rgb(p, q, h - 1/3);
+  }
+  return [
+    Math.round(r * 255),
+    Math.round(g * 255),
+    Math.round(b * 255)
+  ];
+}
+
+function varyHSL(h, s, l, hRange, sRange, lRange) {
+  return {
+    h: clamp(h + randRange(-hRange, hRange), 0, 360),
+    s: clamp(s + randRange(-sRange, sRange), 0, 100),
+    l: clamp(l + randRange(-lRange, lRange), 0, 100),
+  };
+}
+
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+function putPixel(imageData, x, y, r, g, b, a = 255) {
+  if (x < 0 || y < 0 || x >= imageData.width || y >= imageData.height) return;
+  const i = (y * imageData.width + x) * 4;
+  imageData.data[i] = r;
+  imageData.data[i + 1] = g;
+  imageData.data[i + 2] = b;
+  imageData.data[i + 3] = a;
+}
+
+function createOffscreenCanvas(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  return c;
+}
+
+function resize() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  const s = CONFIG.pixelScale;
+  canvas.width = Math.floor(w / s);
+  canvas.height = Math.floor(h / s);
+  ctx.imageSmoothingEnabled = false;
+  bgCanvas = null;
+}
+
+// ---- Sprite Engine ----
+
+const SPRITE_SIZE = 64;
+const SPECIES = [];
+let bgCanvas = null;
+
+function defineSpecies(config) {
+  SPECIES.push(config);
+  return config;
+}
+
+function makeSpriteCanvas(species, colorVariation) {
+  const size = species.size || SPRITE_SIZE;
+  const off = createOffscreenCanvas(size, size);
+  const octx = off.getContext('2d');
+  const img = octx.createImageData(size, size);
+
+  // 1. Draw body silhouette
+  const bodyMask = species.body(size);
+  const bodyColors = species.colors.body;
+  const h = varyHSL(bodyColors.h, bodyColors.s, bodyColors.l, colorVariation.hue, colorVariation.sat, colorVariation.light);
+  const [br, bg, bb] = hslToRgb(h.h, h.s, h.l);
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      if (bodyMask[y][x]) {
+        let pr = br, pg = bg, pb = bb;
+        if (species.pattern) {
+          const pc = species.pattern(x, y, size, bodyMask, br, bg, bb, colorVariation);
+          if (pc) { pr = pc[0]; pg = pc[1]; pb = pc[2]; }
+        }
+        const n = 1 - (rand() * 0.05);
+        putPixel(img, x, y, Math.round(pr * n), Math.round(pg * n), Math.round(pb * n));
+      }
+    }
+  }
+
+  // 2. Draw fins
+  if (species.fins) {
+    for (const fin of species.fins) {
+      const finMask = fin.mask(size);
+      const finColors = fin.colors || species.colors.fins || species.colors.body;
+      const fh = varyHSL(finColors.h, finColors.s, finColors.l, colorVariation.hue, colorVariation.sat, colorVariation.light);
+      const [fr, fg, fb] = hslToRgb(fh.h, fh.s, fh.l);
+
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          if (finMask[y][x]) {
+            putPixel(img, x, y, fr, fg, fb, 255);
+          }
+        }
+      }
+    }
+  }
+
+  // 3. Draw eye
+  if (species.eye) {
+    const eye = species.eye(size);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        if (eye[y][x]) {
+          putPixel(img, x, y, eye[y][x][0], eye[y][x][1], eye[y][x][2], 255);
+        }
+      }
+    }
+  }
+
+  octx.putImageData(img, 0, 0);
+  return off;
+}
+
+// Mask helpers
+
+function emptyMask(size) {
+  return Array.from({ length: size }, () => new Array(size).fill(false));
+}
+
+function fillCircle(mask, cx, cy, r) {
+  for (let y = Math.max(0, Math.floor(cy - r)); y < Math.min(mask.length, Math.ceil(cy + r)); y++) {
+    for (let x = Math.max(0, Math.floor(cx - r)); x < Math.min(mask[0].length, Math.ceil(cx + r)); x++) {
+      if ((x - cx) ** 2 + (y - cy) ** 2 <= r ** 2) {
+        mask[y][x] = true;
+      }
+    }
+  }
+}
+
+function fillEllipse(mask, cx, cy, rx, ry) {
+  for (let y = Math.max(0, Math.floor(cy - ry)); y < Math.min(mask.length, Math.ceil(cy + ry)); y++) {
+    for (let x = Math.max(0, Math.floor(cx - rx)); x < Math.min(mask[0].length, Math.ceil(cx + rx)); x++) {
+      if (((x - cx) ** 2) / (rx ** 2) + ((y - cy) ** 2) / (ry ** 2) <= 1) {
+        mask[y][x] = true;
+      }
+    }
+  }
+}
+
+function fillRect(mask, x1, y1, x2, y2) {
+  for (let y = Math.max(0, y1); y < Math.min(mask.length, y2); y++) {
+    for (let x = Math.max(0, x1); x < Math.min(mask[0].length, x2); x++) {
+      mask[y][x] = true;
+    }
+  }
+}
+
+function fillTriangle(mask, x1, y1, x2, y2, x3, y3) {
+  const minX = Math.max(0, Math.floor(Math.min(x1, x2, x3)));
+  const maxX = Math.min(mask[0].length, Math.ceil(Math.max(x1, x2, x3)));
+  const minY = Math.max(0, Math.floor(Math.min(y1, y2, y3)));
+  const maxY = Math.min(mask.length, Math.ceil(Math.max(y1, y2, y3)));
+  for (let y = minY; y < maxY; y++) {
+    for (let x = minX; x < maxX; x++) {
+      if (pointInTriangle(x, y, x1, y1, x2, y2, x3, y3)) {
+        mask[y][x] = true;
+      }
+    }
+  }
+}
+
+function pointInTriangle(px, py, x1, y1, x2, y2, x3, y3) {
+  const d1 = (px - x2) * (y1 - y2) - (x1 - x2) * (py - y2);
+  const d2 = (px - x3) * (y2 - y3) - (x2 - x3) * (py - y3);
+  const d3 = (px - x1) * (y3 - y1) - (x3 - x1) * (py - y1);
+  const hasNeg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+  const hasPos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+  return !(hasNeg && hasPos);
+}
+
+const PALETTE_VARIATION = {
+  vibrant: { hue: 15, sat: 10, light: 10 },
+  natural:  { hue: 10, sat: 15, light: 12 },
+  pastel:   { hue: 8,  sat: 10, light: 8 },
+  neon:     { hue: 10, sat: 5,  light: 10 },
+};
+
+function getColorVariation() {
+  return PALETTE_VARIATION[CONFIG.palette] || PALETTE_VARIATION.vibrant;
+}
+
+// ---- Sprite Cache ----
+
+const spriteCache = new Map();
+
+function getSprite(species, colorVariation) {
+  const key = species.name + JSON.stringify(colorVariation);
+  if (spriteCache.has(key)) return spriteCache.get(key);
+  const canvas = makeSpriteCanvas(species, colorVariation);
+  spriteCache.set(key, canvas);
+  return canvas;
+}
+
+// ---- Species Definitions ----
+
+const SPECIES_CLOWNFISH = defineSpecies({
+  name: 'clownfish',
+  size: 48,
+  colors: {
+    body: { h: 25, s: 95, l: 55 },
+    fins: { h: 15, s: 90, l: 70 },
+  },
+  body(size) {
+    const m = emptyMask(size);
+    const cx = size / 2;
+    const cy = size * 0.52;
+    fillEllipse(m, cx, cy, size * 0.35, size * 0.22);
+    fillEllipse(m, cx + size * 0.16, cy - size * 0.02, size * 0.15, size * 0.18);
+    fillEllipse(m, cx + size * 0.28, cy - size * 0.03, size * 0.07, size * 0.1);
+    return m;
+  },
+  pattern(x, y, size, mask, br, bg, bb, cv) {
+    const cx = size / 2;
+    const band1Dist = Math.abs(x - (cx + size * 0.22));
+    if (band1Dist <= 3 && mask[y][x]) return [255, 255, 255];
+    const band2Dist = Math.abs(x - cx);
+    if (band2Dist <= 3 && mask[y][x]) return [255, 255, 255];
+    const band3Dist = Math.abs(x - (cx - size * 0.18));
+    if (band3Dist <= 2 && mask[y][x] && x > cx - size * 0.25) return [255, 255, 255];
+    if (band1Dist >= 4 && band1Dist <= 5 && mask[y][x]) return [20, 20, 20];
+    if (band2Dist >= 4 && band2Dist <= 5 && mask[y][x]) return [20, 20, 20];
+    if (band3Dist >= 3 && band3Dist <= 4 && mask[y][x] && x > cx - size * 0.25) return [20, 20, 20];
+    return null;
+  },
+  fins: [
+    {
+      mask(size) {
+        const m = emptyMask(size);
+        const cx = size / 2;
+        fillTriangle(m, cx - size * 0.3, size * 0.48, cx - size * 0.38, size * 0.35, cx - size * 0.38, size * 0.61);
+        fillTriangle(m, cx - size * 0.3, size * 0.48, cx - size * 0.28, size * 0.32, cx - size * 0.28, size * 0.64);
+        fillTriangle(m, cx - size * 0.05, size * 0.28, cx - size * 0.18, size * 0.14, cx + size * 0.1, size * 0.28);
+        fillTriangle(m, cx + size * 0.05, size * 0.6, cx - size * 0.05, size * 0.56, cx - size * 0.02, size * 0.72);
+        fillTriangle(m, cx + size * 0.05, size * 0.4, cx - size * 0.05, size * 0.44, cx - size * 0.02, size * 0.28);
+        return m;
+      }
+    }
+  ],
+  eye(size) {
+    const e = emptyMask(size);
+    const cx = size / 2;
+    const ex = cx + size * 0.22, ey = size * 0.44;
+    fillCircle(e, ex, ey, 3);
+    e[ey][ex] = [255, 255, 255];
+    return e;
+  }
+});
+
+const SPECIES_ANGELFISH = defineSpecies({
+  name: 'angelfish',
+  size: 56,
+  colors: {
+    body: { h: 210, s: 15, l: 75 },
+    fins: { h: 210, s: 10, l: 70 },
+  },
+  body(size) {
+    const m = emptyMask(size);
+    const cx = size / 2, cy = size * 0.5;
+    fillEllipse(m, cx, cy, size * 0.12, size * 0.38);
+    fillEllipse(m, cx + size * 0.08, cy - size * 0.02, size * 0.1, size * 0.24);
+    return m;
+  },
+  pattern(x, y, size, mask, br, bg, bb, cv) {
+    const cx = size / 2;
+    if (!mask[y][x]) return null;
+    const stripes = [cx + size * 0.08, cx, cx - size * 0.08, cx - size * 0.16];
+    for (const sx of stripes) {
+      if (Math.abs(x - sx) <= 2.5) return [15, 15, 15];
+    }
+    return null;
+  },
+  fins: [
+    {
+      mask(size) {
+        const m = emptyMask(size);
+        const cx = size / 2, cy = size * 0.5;
+        fillTriangle(m, cx - size * 0.05, cy - size * 0.32, cx - size * 0.25, cy - size * 0.22, cx + size * 0.02, cy - size * 0.22);
+        fillTriangle(m, cx - size * 0.08, cy - size * 0.42, cx - size * 0.15, cy - size * 0.22, cx - size * 0.02, cy - size * 0.22);
+        fillTriangle(m, cx - size * 0.05, cy + size * 0.32, cx - size * 0.25, cy + size * 0.22, cx + size * 0.02, cy + size * 0.22);
+        fillTriangle(m, cx - size * 0.08, cy + size * 0.42, cx - size * 0.15, cy + size * 0.22, cx - size * 0.02, cy + size * 0.22);
+        fillTriangle(m, cx - size * 0.14, cy, cx - size * 0.24, cy - size * 0.2, cx - size * 0.24, cy + size * 0.2);
+        fillTriangle(m, cx - size * 0.14, cy, cx - size * 0.32, cy - size * 0.14, cx - size * 0.32, cy + size * 0.14);
+        return m;
+      }
+    }
+  ],
+  eye(size) {
+    const e = emptyMask(size);
+    fillCircle(e, Math.floor(size * 0.62), Math.floor(size * 0.42), 3);
+    e[Math.floor(size * 0.42)][Math.floor(size * 0.62)] = [255, 255, 255];
+    return e;
+  }
+});
+
+const SPECIES_SCORPIONFISH = defineSpecies({
+  name: 'scorpionfish',
+  size: 48,
+  colors: {
+    body: { h: 20, s: 60, l: 35 },
+    fins: { h: 15, s: 50, l: 30 },
+  },
+  body(size) {
+    const m = emptyMask(size);
+    const cx = size * 0.48, cy = size * 0.52;
+    fillEllipse(m, cx, cy, size * 0.35, size * 0.25);
+    fillRect(m, Math.floor(cx + size * 0.15), Math.floor(cy - size * 0.2), Math.floor(cx + size * 0.28), Math.floor(cy + size * 0.2));
+    fillRect(m, Math.floor(cx - size * 0.15), Math.floor(cy - size * 0.15), Math.floor(cx - size * 0.05), Math.floor(cy + size * 0.15));
+    return m;
+  },
+  pattern(x, y, size, mask, br, bg, bb, cv) {
+    if (!mask[y][x]) return null;
+    const cx = size * 0.48, cy = size * 0.52;
+    const dx = x - cx, dy = y - cy;
+    const noise = Math.sin(dx * 0.5) * Math.cos(dy * 0.7) + Math.sin(dx * 1.3) * Math.cos(dy * 0.3);
+    if (noise > 0.4) return [Math.round(br * 0.6), Math.round(bg * 0.5), Math.round(bb * 0.4)];
+    if (noise < -0.4) return [Math.round(br * 1.3), Math.round(bg * 1.2), Math.round(bb * 1.1)];
+    return null;
+  },
+  fins: [
+    {
+      mask(size) {
+        const m = emptyMask(size);
+        const cx = size * 0.48;
+        for (let i = 0; i < 7; i++) {
+          const fx = cx - size * 0.25 + i * size * 0.08;
+          const fy = size * 0.18;
+          fillTriangle(m, fx - 2, fy + size * 0.1, fx, fy, fx + 2, fy + size * 0.1);
+        }
+        fillTriangle(m, cx - size * 0.3, size * 0.45, cx - size * 0.42, size * 0.3, cx - size * 0.42, size * 0.6);
+        fillTriangle(m, cx - size * 0.3, size * 0.45, cx - size * 0.48, size * 0.35, cx - size * 0.48, size * 0.55);
+        return m;
+      }
+    }
+  ],
+  eye(size) {
+    const e = emptyMask(size);
+    fillCircle(e, Math.floor(size * 0.62), Math.floor(size * 0.42), 3);
+    e[Math.floor(size * 0.42)][Math.floor(size * 0.62)] = [255, 255, 255];
+    return e;
+  }
+});
+
+const SPECIES_NEON_TETRA = defineSpecies({
+  name: 'neon_tetra',
+  size: 48,
+  colors: {
+    body: { h: 200, s: 80, l: 55 },
+    fins: { h: 200, s: 60, l: 50 },
+  },
+  body(size) {
+    const m = emptyMask(size);
+    const cx = size / 2, cy = size * 0.5;
+    fillEllipse(m, cx, cy, size * 0.4, size * 0.11);
+    fillTriangle(m, cx + size * 0.35, cy - size * 0.08, cx + size * 0.48, cy, cx + size * 0.35, cy + size * 0.08);
+    fillEllipse(m, cx, cy + size * 0.04, size * 0.38, size * 0.08);
+    return m;
+  },
+  pattern(x, y, size, mask, br, bg, bb, cv) {
+    if (!mask[y][x]) return null;
+    const cy = size * 0.5;
+    if (y <= cy) return [br, bg, bb];
+    const rh = varyHSL(0, 90, 50, 5, 5, 5);
+    const [rr, rg, rb] = hslToRgb(rh.h, rh.s, rh.l);
+    if (y > cy) return [rr, rg, rb];
+    return [220, 235, 240];
+  },
+  fins: [
+    {
+      mask(size) {
+        const m = emptyMask(size);
+        const cx = size / 2, cy = size * 0.5;
+        fillTriangle(m, cx - size * 0.05, cy - size * 0.1, cx - size * 0.2, cy - size * 0.28, cx, cy - size * 0.1);
+        fillTriangle(m, cx - size * 0.33, cy, cx - size * 0.44, cy - size * 0.1, cx - size * 0.44, cy + size * 0.1);
+        fillTriangle(m, cx - size * 0.33, cy, cx - size * 0.4, cy - size * 0.16, cx - size * 0.4, cy + size * 0.16);
+        return m;
+      }
+    }
+  ],
+  eye(size) {
+    const e = emptyMask(size);
+    fillCircle(e, Math.floor(size * 0.72), Math.floor(size * 0.42), 3);
+    e[Math.floor(size * 0.42)][Math.floor(size * 0.72)] = [255, 255, 255];
+    return e;
+  }
+});
+
+const SPECIES_MOORISH_IDOL = defineSpecies({
+  name: 'moorish_idol',
+  size: 56,
+  colors: {
+    body: { h: 60, s: 5, l: 85 },
+    fins: { h: 40, s: 80, l: 65 },
+  },
+  body(size) {
+    const m = emptyMask(size);
+    const cx = size / 2, cy = size * 0.5;
+    fillEllipse(m, cx, cy, size * 0.12, size * 0.35);
+    fillEllipse(m, cx + size * 0.14, cy, size * 0.08, size * 0.06);
+    return m;
+  },
+  pattern(x, y, size, mask, br, bg, bb, cv) {
+    if (!mask[y][x]) return null;
+    const cx = size / 2;
+    if (Math.abs(x - (cx + size * 0.04)) <= 4) return [15, 15, 15];
+    if (Math.abs(x - (cx - size * 0.07)) <= 4) return [15, 15, 15];
+    if (x < cx - size * 0.03 && y > size * 0.45 && y < size * 0.65 && mask[y][x]) {
+      const yh = varyHSL(45, 90, 60, 5, 5, 5);
+      return hslToRgb(yh.h, yh.s, yh.l);
+    }
+    return null;
+  },
+  fins: [
+    {
+      mask(size) {
+        const m = emptyMask(size);
+        const cx = size / 2, cy = size * 0.5;
+        fillTriangle(m, cx - size * 0.08, cy - size * 0.3, cx - size * 0.2, cy - size * 0.45, cx + size * 0.02, cy - size * 0.2);
+        fillRect(m, Math.floor(cx - size * 0.18), Math.floor(cy - size * 0.46), Math.floor(cx - size * 0.14), Math.floor(cy - size * 0.3));
+        fillTriangle(m, cx - size * 0.05, cy - size * 0.28, cx - size * 0.1, cy - size * 0.38, cx + size * 0.04, cy - size * 0.2);
+        fillTriangle(m, cx - size * 0.05, cy + size * 0.28, cx - size * 0.1, cy + size * 0.38, cx + size * 0.04, cy + size * 0.2);
+        fillTriangle(m, cx - size * 0.15, cy, cx - size * 0.26, cy - size * 0.18, cx - size * 0.26, cy + size * 0.18);
+        fillTriangle(m, cx - size * 0.15, cy, cx - size * 0.32, cy - size * 0.12, cx - size * 0.32, cy + size * 0.12);
+        return m;
+      }
+    }
+  ],
+  eye(size) {
+    const e = emptyMask(size);
+    fillCircle(e, Math.floor(size * 0.64), Math.floor(size * 0.4), 2);
+    e[Math.floor(size * 0.4)][Math.floor(size * 0.64)] = [255, 255, 255];
+    return e;
+  }
+});
+
+const SPECIES_GOLDFISH = defineSpecies({
+  name: 'goldfish',
+  size: 48,
+  colors: {
+    body: { h: 30, s: 95, l: 55 },
+    fins: { h: 25, s: 90, l: 65 },
+  },
+  body(size) {
+    const m = emptyMask(size);
+    const cx = size * 0.46, cy = size * 0.48;
+    fillEllipse(m, cx, cy, size * 0.32, size * 0.28);
+    fillEllipse(m, cx + size * 0.22, cy - size * 0.08, size * 0.14, size * 0.18);
+    return m;
+  },
+  pattern(x, y, size, mask, br, bg, bb, cv) {
+    if (!mask[y][x]) return null;
+    const cx = size * 0.46;
+    const patch = Math.sin(x * 0.6) * Math.cos(y * 0.8);
+    if (patch > 0.7) return [255, 245, 235];
+    return null;
+  },
+  fins: [
+    {
+      mask(size) {
+        const m = emptyMask(size);
+        const cx = size * 0.46, cy = size * 0.48;
+        fillTriangle(m, cx - size * 0.28, cy - size * 0.02, cx - size * 0.42, cy - size * 0.3, cx - size * 0.42, cy + size * 0.3);
+        fillTriangle(m, cx - size * 0.25, cy, cx - size * 0.44, cy - size * 0.15, cx - size * 0.44, cy + size * 0.15);
+        fillTriangle(m, cx - size * 0.22, cy + size * 0.05, cx - size * 0.46, cy - size * 0.05, cx - size * 0.46, cy + size * 0.25);
+        fillTriangle(m, cx - size * 0.08, cy - size * 0.22, cx - size * 0.2, cy - size * 0.38, cx, cy - size * 0.22);
+        return m;
+      }
+    }
+  ],
+  eye(size) {
+    const e = emptyMask(size);
+    fillCircle(e, Math.floor(size * 0.68), Math.floor(size * 0.36), 3);
+    e[Math.floor(size * 0.36)][Math.floor(size * 0.68)] = [255, 255, 255];
+    return e;
+  }
+});
+
+const SPECIES_BOXFISH = defineSpecies({
+  name: 'boxfish',
+  size: 48,
+  colors: {
+    body: { h: 55, s: 90, l: 55 },
+    fins: { h: 55, s: 70, l: 50 },
+  },
+  body(size) {
+    const m = emptyMask(size);
+    const cx = size * 0.5, cy = size * 0.5;
+    fillRect(m, Math.floor(cx - size * 0.25), Math.floor(cy - size * 0.22), Math.floor(cx + size * 0.25), Math.floor(cy + size * 0.22));
+    fillCircle(m, cx - size * 0.2, cy - size * 0.17, 5);
+    fillCircle(m, cx + size * 0.2, cy - size * 0.17, 5);
+    fillCircle(m, cx - size * 0.2, cy + size * 0.17, 5);
+    fillCircle(m, cx + size * 0.2, cy + size * 0.17, 5);
+    return m;
+  },
+  pattern(x, y, size, mask, br, bg, bb, cv) {
+    if (!mask[y][x]) return null;
+    const cx = size * 0.5, cy = size * 0.5;
+    const spots = [[-6,-5],[3,-8],[-3,6],[7,2],[-8,0],[1,-2],[5,-3],[-5,4]];
+    for (const [sx, sy] of spots) {
+      const dx = x - (cx + sx), dy = y - (cy + sy);
+      if (dx * dx + dy * dy <= 9) return [20, 30, 60];
+    }
+    return null;
+  },
+  fins: [
+    {
+      mask(size) {
+        const m = emptyMask(size);
+        const cx = size * 0.5, cy = size * 0.5;
+        fillTriangle(m, cx, cy - size * 0.22, cx - 5, cy - size * 0.32, cx + 3, cy - size * 0.22);
+        fillTriangle(m, cx, cy + size * 0.22, cx - 5, cy + size * 0.32, cx + 3, cy + size * 0.22);
+        fillTriangle(m, cx - size * 0.25, cy, cx - size * 0.32, cy - 6, cx - size * 0.32, cy + 6);
+        return m;
+      }
+    }
+  ],
+  eye(size) {
+    const e = emptyMask(size);
+    fillCircle(e, Math.floor(size * 0.62), Math.floor(size * 0.38), 3);
+    e[Math.floor(size * 0.38)][Math.floor(size * 0.62)] = [255, 255, 255];
+    return e;
+  }
+});
+
+const SPECIES_BUTTERFLYFISH = defineSpecies({
+  name: 'butterflyfish',
+  size: 48,
+  colors: {
+    body: { h: 50, s: 90, l: 55 },
+    fins: { h: 50, s: 80, l: 50 },
+  },
+  body(size) {
+    const m = emptyMask(size);
+    const cx = size / 2, cy = size * 0.5;
+    fillEllipse(m, cx, cy, size * 0.14, size * 0.36);
+    fillEllipse(m, cx + size * 0.16, cy, size * 0.08, size * 0.06);
+    return m;
+  },
+  pattern(x, y, size, mask, br, bg, bb, cv) {
+    if (!mask[y][x]) return null;
+    const cx = size / 2;
+    if (Math.abs(x - (cx + size * 0.12)) <= 3 && y > size * 0.25 && y < size * 0.55) return [15, 15, 15];
+    if (Math.abs(x - (cx - size * 0.08)) <= 3 && y > size * 0.3 && y < size * 0.6) return [15, 15, 15];
+    return null;
+  },
+  fins: [
+    {
+      mask(size) {
+        const m = emptyMask(size);
+        const cx = size / 2, cy = size * 0.5;
+        fillTriangle(m, cx - size * 0.1, cy - size * 0.3, cx - size * 0.22, cy - size * 0.14, cx + size * 0.04, cy - size * 0.22);
+        fillTriangle(m, cx - size * 0.1, cy + size * 0.3, cx - size * 0.22, cy + size * 0.14, cx + size * 0.04, cy + size * 0.22);
+        fillTriangle(m, cx - size * 0.16, cy, cx - size * 0.28, cy - size * 0.16, cx - size * 0.28, cy + size * 0.16);
+        return m;
+      }
+    }
+  ],
+  eye(size) {
+    const e = emptyMask(size);
+    fillCircle(e, Math.floor(size * 0.66), Math.floor(size * 0.4), 3);
+    e[Math.floor(size * 0.4)][Math.floor(size * 0.66)] = [255, 255, 255];
+    return e;
+  }
+});
+
+const SPECIES_LIONFISH = defineSpecies({
+  name: 'lionfish',
+  size: 56,
+  colors: {
+    body: { h: 0, s: 70, l: 45 },
+    fins: { h: 0, s: 80, l: 50 },
+  },
+  body(size) {
+    const m = emptyMask(size);
+    const cx = size * 0.48, cy = size * 0.5;
+    fillEllipse(m, cx, cy, size * 0.3, size * 0.14);
+    fillEllipse(m, cx + size * 0.22, cy, size * 0.1, size * 0.11);
+    return m;
+  },
+  pattern(x, y, size, mask, br, bg, bb, cv) {
+    if (!mask[y][x]) return null;
+    const cx = size * 0.48;
+    for (let i = 0; i < 10; i++) {
+      const sx = cx - size * 0.22 + i * 6;
+      if (Math.abs(x - sx) <= 1.5) return [240, 235, 225];
+    }
+    return null;
+  },
+  fins: [
+    {
+      mask(size) {
+        const m = emptyMask(size);
+        const cx = size * 0.48, cy = size * 0.5;
+        for (let i = 0; i < 12; i++) {
+          const angle = -Math.PI * 0.65 + i * Math.PI * 1.3 / 11;
+          const lx = cx - 5 + i * 1.5;
+          const len = 18 + Math.sin(i * 0.5) * 6;
+          for (let j = 0; j < len; j++) {
+            const px = Math.round(lx + Math.cos(angle) * j);
+            const py = Math.round(cy + Math.sin(angle) * j);
+            if (px >= 0 && px < size && py >= 0 && py < size) {
+              m[py][px] = true;
+            }
+          }
+        }
+        for (let i = 0; i < 10; i++) {
+          const angle = Math.PI * 0.12 + i * Math.PI * 0.8 / 9;
+          const lx = cx - 3 + i * 1.5;
+          const len = 15 + Math.sin(i * 0.6) * 5;
+          for (let j = 0; j < len; j++) {
+            const px = Math.round(lx + Math.cos(angle) * j);
+            const py = Math.round(cy + Math.sin(angle) * j);
+            if (px >= 0 && px < size && py >= 0 && py < size) {
+              m[py][px] = true;
+            }
+          }
+        }
+        fillTriangle(m, cx - size * 0.28, cy, cx - size * 0.4, cy - 8, cx - size * 0.4, cy + 8);
+        fillTriangle(m, cx - size * 0.26, cy, cx - size * 0.44, cy - 6, cx - size * 0.44, cy + 6);
+        return m;
+      }
+    }
+  ],
+  eye(size) {
+    const e = emptyMask(size);
+    fillCircle(e, Math.floor(size * 0.68), Math.floor(size * 0.42), 3);
+    e[Math.floor(size * 0.42)][Math.floor(size * 0.68)] = [255, 255, 255];
+    return e;
+  }
+});
+
+const SPECIES_BLUE_TANG = defineSpecies({
+  name: 'blue_tang',
+  size: 48,
+  colors: {
+    body: { h: 210, s: 85, l: 50 },
+    fins: { h: 215, s: 80, l: 45 },
+  },
+  body(size) {
+    const m = emptyMask(size);
+    const cx = size / 2, cy = size * 0.5;
+    fillEllipse(m, cx, cy, size * 0.38, size * 0.18);
+    fillEllipse(m, cx + size * 0.28, cy, size * 0.1, size * 0.15);
+    fillEllipse(m, cx + size * 0.36, cy + size * 0.02, size * 0.06, size * 0.07);
+    return m;
+  },
+  pattern(x, y, size, mask, br, bg, bb, cv) {
+    if (!mask[y][x]) return null;
+    const cx = size / 2;
+    if (Math.abs(x - cx) <= 2 && y > size * 0.3 && mask[y][x]) return [15, 15, 15];
+    if (x < cx - size * 0.2 && x > cx - size * 0.3 && mask[y][x]) {
+      const yh = varyHSL(50, 90, 55, 5, 5, 5);
+      return hslToRgb(yh.h, yh.s, yh.l);
+    }
+    return null;
+  },
+  fins: [
+    {
+      mask(size) {
+        const m = emptyMask(size);
+        const cx = size / 2, cy = size * 0.5;
+        fillTriangle(m, cx - size * 0.1, cy - size * 0.18, cx - size * 0.25, cy - size * 0.32, cx + size * 0.05, cy - size * 0.16);
+        fillTriangle(m, cx - size * 0.1, cy + size * 0.18, cx - size * 0.25, cy + size * 0.32, cx + size * 0.05, cy + size * 0.16);
+        fillTriangle(m, cx - size * 0.32, cy, cx - size * 0.44, cy - size * 0.18, cx - size * 0.44, cy + size * 0.18);
+        return m;
+      }
+    }
+  ],
+  eye(size) {
+    const e = emptyMask(size);
+    fillCircle(e, Math.floor(size * 0.74), Math.floor(size * 0.42), 3);
+    e[Math.floor(size * 0.42)][Math.floor(size * 0.74)] = [255, 255, 255];
+    return e;
+  }
+});
+
+window.addEventListener('resize', resize);
+resize();
+
+// Exit on any input
+function exitHandler(e) {
+  if (e.type === 'keydown' || e.type === 'mousemove' || e.type === 'click' || e.type === 'touchstart') {
+    window.close();
+  }
+}
+window.addEventListener('keydown', exitHandler);
+window.addEventListener('mousemove', exitHandler);
+window.addEventListener('click', exitHandler);
+window.addEventListener('touchstart', exitHandler);
+
+// ---- Background Generation ----
+
+const BG_PRESETS = {
+  tropical: {
+    waterTop: [64, 180, 210],
+    waterBottom: [20, 80, 140],
+    terrainColor: { h: 40, s: 60, l: 45 },
+    terrainAccent: { h: 35, s: 70, l: 55 },
+    plantColors: [{ h: 120, s: 70, l: 35 }, { h: 140, s: 60, l: 40 }, { h: 100, s: 50, l: 30 }],
+    decorType: 'coral',
+  },
+  deep: {
+    waterTop: [15, 30, 60],
+    waterBottom: [5, 10, 25],
+    terrainColor: { h: 220, s: 15, l: 25 },
+    terrainAccent: { h: 210, s: 20, l: 35 },
+    plantColors: [{ h: 180, s: 30, l: 20 }, { h: 200, s: 20, l: 25 }],
+    decorType: 'vent',
+  },
+  green: {
+    waterTop: [120, 160, 100],
+    waterBottom: [40, 70, 30],
+    terrainColor: { h: 80, s: 30, l: 25 },
+    terrainAccent: { h: 70, s: 35, l: 35 },
+    plantColors: [{ h: 100, s: 60, l: 30 }, { h: 120, s: 50, l: 25 }, { h: 90, s: 55, l: 35 }],
+    decorType: 'log',
+  },
+  oled: {
+    waterTop: [0, 0, 0],
+    waterBottom: [0, 0, 0],
+    terrainColor: { h: 0, s: 0, l: 8 },
+    terrainAccent: { h: 0, s: 0, l: 12 },
+    plantColors: [{ h: 180, s: 60, l: 15 }, { h: 200, s: 50, l: 12 }],
+    decorType: 'minimal',
+  },
+};
+
+function generateBackground() {
+  const w = canvas.width;
+  const h = canvas.height;
+  const preset = BG_PRESETS[CONFIG.bg] || BG_PRESETS.tropical;
+
+  bgCanvas = createOffscreenCanvas(w, h);
+  const g = bgCanvas.getContext('2d');
+
+  // 1. Water gradient
+  const grad = g.createLinearGradient(0, 0, 0, h);
+  const [topR, topG, topB] = preset.waterTop;
+  const [botR, botG, botB] = preset.waterBottom;
+  grad.addColorStop(0, `rgb(${topR},${topG},${topB})`);
+  grad.addColorStop(1, `rgb(${botR},${botB},${botB})`);
+  g.fillStyle = grad;
+  g.fillRect(0, 0, w, h);
+
+  // 2. Terrain contour
+  const floorPhase1 = randRange(0, Math.PI * 2);
+  const floorPhase2 = randRange(0, Math.PI * 2);
+  const floorBase = h * (1 - randRange(0.15, 0.25));
+
+  const terrainColor = preset.terrainColor;
+  const [tr, tg, tb] = hslToRgb(terrainColor.h, terrainColor.s, terrainColor.l);
+
+  g.fillStyle = `rgb(${tr},${tg},${tb})`;
+  g.beginPath();
+  g.moveTo(0, h);
+  for (let x = 0; x <= w; x++) {
+    const y = floorBase +
+      Math.sin(x * 0.008 + floorPhase1) * h * 0.06 +
+      Math.sin(x * 0.018 + floorPhase2) * h * 0.03;
+    g.lineTo(x, y);
+  }
+  g.lineTo(w, h);
+  g.closePath();
+  g.fill();
+
+  // 3. Terrain accents
+  const [ar, ag, ab] = hslToRgb(preset.terrainAccent.h, preset.terrainAccent.s, preset.terrainAccent.l);
+  for (let i = 0; i < w * 0.5; i++) {
+    const tx = randRange(0, w);
+    const ty = floorBase + Math.sin(tx * 0.008 + floorPhase1) * h * 0.06 +
+               Math.sin(tx * 0.018 + floorPhase2) * h * 0.03 + randRange(0, h * 0.05);
+    if (ty >= 0 && ty < h) {
+      g.fillStyle = `rgba(${ar},${ag},${ab},${randRange(0.3, 0.8)})`;
+      g.fillRect(tx, ty, randRange(1, 4), randRange(1, 3));
+    }
+  }
+
+  // 4. Vegetation
+  const plantCount = Math.floor(w / 80);
+  const plantColors = preset.plantColors;
+  const placements = [];
+
+  for (let i = 0; i < plantCount; i++) {
+    const px = randRange(20, w - 20);
+    const py = floorBase + Math.sin(px * 0.008 + floorPhase1) * h * 0.06 +
+               Math.sin(px * 0.018 + floorPhase2) * h * 0.03;
+
+    let tooClose = false;
+    for (const [opx] of placements) {
+      if (Math.abs(px - opx) < 40) { tooClose = true; break; }
+    }
+    if (tooClose) continue;
+    placements.push([px, py]);
+
+    const plantType = randInt(0, 2);
+    const pc = plantColors[randInt(0, plantColors.length - 1)];
+    const [pr, pg, pb] = hslToRgb(
+      varyHSL(pc.h, pc.s, pc.l, 10, 15, 8).h,
+      varyHSL(pc.h, pc.s, pc.l, 10, 15, 8).s,
+      varyHSL(pc.h, pc.s, pc.l, 10, 15, 8).l
+    );
+
+    g.strokeStyle = `rgb(${pr},${pg},${pb})`;
+    g.lineWidth = 2;
+
+    if (plantType === 0) {
+      const strands = randInt(2, 4);
+      const kelpH = randRange(h * 0.08, h * 0.25);
+      for (let s = 0; s < strands; s++) {
+        g.beginPath();
+        const sx = px + (s - strands / 2) * 3;
+        g.moveTo(sx, py);
+        for (let j = 1; j <= 8; j++) {
+          const t = j / 8;
+          const wx = Math.sin(j * 0.7 + rand()) * 4;
+          g.lineTo(sx + wx, py - kelpH * t);
+        }
+        g.stroke();
+      }
+      g.fillStyle = `rgb(${pr},${pg + 20},${pb})`;
+      for (let s = 0; s < strands; s++) {
+        const sx = px + (s - strands / 2) * 3;
+        for (let j = 1; j <= 4; j++) {
+          const t = j / 4;
+          const ly = py - kelpH * t;
+          const lx = sx + Math.sin(j * 1.2) * 4;
+          g.fillRect(lx - 2, Math.round(ly) - 1, 4, 3);
+        }
+      }
+    } else if (plantType === 1) {
+      const bushH = randRange(h * 0.05, h * 0.15);
+      const bushW = randRange(8, 15);
+      for (let j = 0; j < 6; j++) {
+        g.beginPath();
+        const bx = px + (j - 2.5) * 3;
+        g.moveTo(bx, py);
+        for (let k = 1; k <= 6; k++) {
+          const t = k / 6;
+          const wx = Math.sin(k * 1.3) * bushW * 0.3;
+          g.lineTo(bx + wx, py - bushH * t);
+        }
+        g.stroke();
+      }
+    } else {
+      for (let j = 0; j < 5; j++) {
+        g.beginPath();
+        const gx = px + randRange(-3, 3);
+        g.moveTo(gx, py);
+        const gh = randRange(4, 10);
+        g.lineTo(gx + randRange(-2, 2), py - gh);
+        g.stroke();
+      }
+    }
+  }
+
+  // 5. Decorations
+  const decorType = preset.decorType;
+  const decorCount = randInt(2, 5);
+
+  for (let i = 0; i < decorCount; i++) {
+    const dx = randRange(30, w - 30);
+    const dy = floorBase + Math.sin(dx * 0.008 + floorPhase1) * h * 0.06 +
+               Math.sin(dx * 0.018 + floorPhase2) * h * 0.03;
+    const [dr, dg, db] = hslToRgb(
+      varyHSL(terrainColor.h + 10, terrainColor.s, terrainColor.l - 10, 10, 10, 8).h,
+      varyHSL(terrainColor.h + 10, terrainColor.s, terrainColor.l - 10, 10, 10, 8).s,
+      varyHSL(terrainColor.h + 10, terrainColor.s, terrainColor.l - 10, 10, 10, 8).l
+    );
+
+    if (decorType === 'coral') {
+      const cr = hslToRgb(
+        varyHSL(randRange(0, 60), 80, 50, 15, 10, 10).h,
+        varyHSL(randRange(0, 60), 80, 50, 15, 10, 10).s,
+        varyHSL(randRange(0, 60), 80, 50, 15, 10, 10).l
+      );
+      g.strokeStyle = `rgb(${cr[0]},${cr[1]},${cr[2]})`;
+      g.lineWidth = 3;
+      for (let b = 0; b < randInt(2, 4); b++) {
+        g.beginPath();
+        let bx = dx + randRange(-5, 5);
+        let by = dy;
+        g.moveTo(bx, by);
+        for (let j = 0; j < randInt(3, 5); j++) {
+          bx += randRange(-4, 4);
+          by -= randRange(5, 12);
+          g.lineTo(bx, by);
+        }
+        g.stroke();
+      }
+    } else if (decorType === 'vent') {
+      g.fillStyle = `rgb(${dr},${dg},${db})`;
+      for (let j = 0; j < randInt(2, 3); j++) {
+        const rx = dx + randRange(-10, 10);
+        const ry = dy - randRange(5, 15);
+        const rw = randRange(10, 20);
+        const rh = randRange(8, 18);
+        g.fillRect(rx, ry, rw, rh);
+        g.fillRect(rx - 3, ry + 4, rw + 6, rh - 4);
+      }
+    } else if (decorType === 'log') {
+      g.fillStyle = `rgb(${dr},${dg},${db})`;
+      const lw = randRange(25, 50);
+      g.fillRect(dx, dy - 4, lw, 8);
+      g.fillRect(dx + 2, dy - 5, lw - 4, 10);
+    } else {
+      g.fillStyle = `rgba(${dr},${dg},${db},0.4)`;
+      g.fillRect(dx, dy - randRange(3, 6), randRange(6, 14), randRange(4, 8));
+    }
+  }
+
+  return bgCanvas;
+}
+
+// ---- Fish Entity System ----
+
+const fish = [];
+const SPECIES_LIST = [
+  SPECIES_CLOWNFISH, SPECIES_ANGELFISH, SPECIES_SCORPIONFISH,
+  SPECIES_NEON_TETRA, SPECIES_MOORISH_IDOL, SPECIES_GOLDFISH,
+  SPECIES_BOXFISH, SPECIES_BUTTERFLYFISH, SPECIES_LIONFISH, SPECIES_BLUE_TANG
+];
+
+function pickSpecies() {
+  if (CONFIG.species !== 'all') {
+    const wanted = CONFIG.species.split(',').map(s => s.trim().toLowerCase());
+    const filtered = SPECIES_LIST.filter(s => wanted.includes(s.name.toLowerCase()));
+    if (filtered.length > 0) return filtered[randInt(0, filtered.length - 1)];
+  }
+  return SPECIES_LIST[randInt(0, SPECIES_LIST.length - 1)];
+}
+
+function spawnFish() {
+  const species = pickSpecies();
+  const cv = getColorVariation();
+  const sprite = getSprite(species, cv);
+  const w = canvas.width;
+  const h = canvas.height;
+
+  const depthPref = species.name === 'scorpionfish' || species.name === 'lionfish'
+    ? { min: 0.75, max: 0.9 }
+    : species.name === 'neon_tetra' || species.name === 'butterflyfish'
+    ? { min: 0.1, max: 0.4 }
+    : { min: 0.15, max: 0.85 };
+
+  const y = randRange(h * depthPref.min, h * depthPref.max);
+  const facingRight = rand() > 0.5;
+  const x = facingRight ? randRange(-50, w * 0.2) : randRange(w * 0.8, w + 50);
+
+  return {
+    species,
+    sprite,
+    x, y,
+    vx: 0, vy: 0,
+    facing: facingRight ? 1 : -1,
+    speed: randRange(30, 50) * SPEED_FACTOR,
+    targetX: facingRight ? w * 0.7 : w * 0.3,
+    targetY: y + randRange(-30, 30),
+    animFrame: 0,
+    animTimer: 0,
+    state: 'cruising',
+    stateTimer: randRange(3, 8),
+    wagPhase: rand() * Math.PI * 2,
+    depth: y,
+  };
+}
+
+function spawnInitialFish() {
+  for (let i = 0; i < FISH_COUNT; i++) {
+    fish.push(spawnFish());
+  }
+}
+
+function updateFish(f, dt) {
+  f.animTimer += dt;
+  f.stateTimer -= dt;
+  f.wagPhase += dt * (f.state === 'darting' ? 12 : 6);
+
+  if (f.stateTimer <= 0) {
+    const roll = rand();
+    if (roll < 0.05) {
+      f.state = 'darting';
+      f.stateTimer = randRange(0.5, 1.5);
+    } else if (roll < 0.2) {
+      f.state = 'wandering';
+      f.stateTimer = randRange(2, 4);
+    } else {
+      f.state = 'cruising';
+      f.stateTimer = randRange(5, 10);
+    }
+    const w = canvas.width;
+    const h = canvas.height;
+    f.targetX = randRange(w * 0.1, w * 0.9);
+    f.targetY = randRange(h * 0.08, h * 0.92);
+  }
+
+  const dx = f.targetX - f.x;
+  const dy = f.targetY - f.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+
+  const speedMult = f.state === 'darting' ? 3.0 :
+                    f.state === 'wandering' ? 1.3 : 0.8;
+
+  if (dist > 5) {
+    const nx = dx / dist;
+    const ny = dy / dist;
+    f.vx += nx * f.speed * speedMult * dt * 2;
+    f.vy += ny * f.speed * speedMult * dt * 2;
+  }
+
+  f.vx *= 0.98;
+  f.vy *= 0.98;
+
+  const currentSpeed = Math.sqrt(f.vx * f.vx + f.vy * f.vy);
+  const maxSpeed = f.speed * speedMult;
+  if (currentSpeed > maxSpeed) {
+    const scale = maxSpeed / currentSpeed;
+    f.vx *= scale;
+    f.vy *= scale;
+  }
+
+  f.x += f.vx * dt;
+  f.y += f.vy * dt;
+
+  if (Math.abs(f.vx) > 2) {
+    f.facing = f.vx > 0 ? 1 : -1;
+  }
+
+  const margin = 40 / CONFIG.pixelScale;
+  const w = canvas.width;
+  const h = canvas.height;
+  if (f.x < margin) { f.targetX = w * 0.6; f.vx += 30 * dt; }
+  if (f.x > w - margin) { f.targetX = w * 0.4; f.vx -= 30 * dt; }
+  if (f.y < margin) { f.targetY = h * 0.5; f.vy += 30 * dt; }
+  if (f.y > h - margin) { f.targetY = h * 0.5; f.vy -= 30 * dt; }
+
+  f.vy += Math.sin(f.wagPhase * 0.5) * 3 * dt;
+
+  f.depth = f.y;
+
+  for (const other of fish) {
+    if (other === f) continue;
+    const odx = f.x - other.x;
+    const ody = f.y - other.y;
+    const oDist = Math.sqrt(odx * odx + ody * ody);
+    if (oDist < 30 && oDist > 0) {
+      const push = (30 - oDist) * 30 * dt;
+      f.vx += (odx / oDist) * push;
+      f.vy += (ody / oDist) * push;
+    }
+  }
+}
+
+function drawFish(f) {
+  const size = (f.species.size || 48) / CONFIG.pixelScale;
+  ctx.save();
+  ctx.translate(f.x, f.y);
+  ctx.scale(f.facing, 1);
+  ctx.drawImage(f.sprite, -size / 2, -size / 2, size, size);
+  ctx.restore();
+}
+
+function updateAndDrawFish(dt) {
+  for (const f of fish) {
+    updateFish(f, dt);
+  }
+  fish.sort((a, b) => a.depth - b.depth);
+  for (const f of fish) {
+    drawFish(f);
+  }
+}
+
+// ---- Effects System ----
+
+const bubbles = [];
+let rareEventTimer = randRange(60, 180);
+let rareEvent = null;
+let rareEventEnd = 0;
+
+function spawnBubble() {
+  const w = canvas.width;
+  const h = canvas.height;
+  return {
+    x: randRange(30, w - 30),
+    y: h - randRange(5, 30),
+    r: randRange(1.5, 3.5),
+    vy: -randRange(10, 25),
+    vx: randRange(-5, 5),
+    life: 1.0,
+  };
+}
+
+function updateBubbles(dt) {
+  if (rand() < dt * 1.5) {
+    bubbles.push(spawnBubble());
+  }
+  if (rareEvent === 'bubble_burst') {
+    const w = canvas.width;
+    for (let i = 0; i < 3; i++) {
+      bubbles.push({
+        x: w * 0.3 + randRange(-20, 20),
+        y: randRange(canvas.height * 0.3, canvas.height * 0.7),
+        r: randRange(1, 3),
+        vy: -randRange(30, 60),
+        vx: randRange(-10, 10),
+        life: 1.0,
+      });
+    }
+  }
+
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    b.y += b.vy * dt;
+    b.x += b.vx * dt;
+    b.life -= dt * 0.3;
+    if (b.y < -10 || b.life <= 0) {
+      bubbles.splice(i, 1);
+    }
+  }
+
+  if (bubbles.length > 20) bubbles.splice(0, bubbles.length - 20);
+}
+
+function drawBubbles() {
+  for (const b of bubbles) {
+    const alpha = b.life;
+    const isOLED = CONFIG.bg === 'oled';
+    if (isOLED) {
+      ctx.strokeStyle = `rgba(100,200,255,${alpha * 0.6})`;
+    } else {
+      ctx.strokeStyle = `rgba(200,230,255,${alpha * 0.7})`;
+      ctx.fillStyle = `rgba(220,240,255,${alpha * 0.3})`;
+    }
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    if (!isOLED) ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = `rgba(255,255,255,${alpha * 0.6})`;
+    ctx.fillRect(b.x - b.r * 0.3, b.y - b.r * 0.6, b.r * 0.6, 1);
+  }
+}
+
+function drawLightRays(time) {
+  const w = canvas.width;
+  const h = canvas.height;
+  const count = CONFIG.bg === 'oled' ? 0 : 3;
+
+  for (let i = 0; i < count; i++) {
+    const rx = w * (0.15 + i * 0.3) + Math.sin(time * 0.3 + i) * w * 0.1;
+    const alpha = 0.03 + Math.sin(time * 0.5 + i * 2) * 0.02;
+
+    ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+    const rayW = w * 0.04;
+    ctx.fillRect(rx - rayW / 2, 0, rayW, h * 0.6);
+
+    ctx.fillStyle = `rgba(255,255,255,${alpha * 0.5})`;
+    for (let j = 0; j < h * 0.5; j += 8) {
+      if (Math.floor(j / 8) % 2 === 0) {
+        ctx.fillRect(rx, j, 2, 4);
+      } else {
+        ctx.fillRect(rx + 4, j, 2, 4);
+      }
+    }
+  }
+}
+
+function updateRareEvents(dt, time) {
+  rareEventTimer -= dt;
+  if (rareEventTimer <= 0 && !rareEvent) {
+    const roll = rand();
+    if (roll < 0.3) {
+      rareEvent = 'big_fish';
+      rareEventEnd = time + 6;
+    } else if (roll < 0.6) {
+      rareEvent = 'bubble_burst';
+      rareEventEnd = time + 2;
+    } else if (roll < 0.9) {
+      rareEvent = 'scatter';
+      rareEventEnd = time + 0.3;
+    } else {
+      rareEvent = 'feeding_drift';
+      rareEventEnd = time + 3;
+    }
+  }
+
+  if (rareEvent && time >= rareEventEnd) {
+    rareEvent = null;
+    rareEventTimer = randRange(60, 180);
+  }
+
+  if (rareEvent === 'scatter') {
+    for (const f of fish) {
+      f.state = 'darting';
+      f.stateTimer = randRange(0.5, 1);
+      f.targetX = randRange(canvas.width * 0.1, canvas.width * 0.9);
+      f.targetY = randRange(canvas.height * 0.08, canvas.height * 0.92);
+    }
+  }
+}
+
+let lastTime = 0;
+function gameLoop(timestamp) {
+  requestAnimationFrame(gameLoop);
+  const rawDt = (timestamp - lastTime) / 1000;
+  lastTime = timestamp;
+
+  if (rawDt < FRAME_TIME / 1000 * 0.9) return;
+  const dt = Math.min(rawDt, 0.1);
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!bgCanvas) {
+    bgCanvas = generateBackground();
+  }
+  ctx.drawImage(bgCanvas, 0, 0);
+
+  if (fish.length === 0) {
+    spawnInitialFish();
+  }
+
+  updateAndDrawFish(dt);
+
+  const time = timestamp / 1000;
+  updateBubbles(dt);
+  updateRareEvents(dt, time);
+  drawBubbles();
+  drawLightRays(time);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
