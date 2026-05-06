@@ -19,4 +19,4 @@ done
 
 PARAMS="${PARAMS%&}"
 exec chromium --kiosk --noerrdialogs --disable-infobars \
-  "file://$DIR/aquascreen.html${PARAMS:+?$PARAMS}"
+  "file://$DIR/index.html${PARAMS:+?$PARAMS}"
