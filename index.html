@@ -51,7 +51,7 @@ if (params.has('help')) {
      ['fps', '30, 60', '60'],
      ['seed', 'any integer', 'random']]
     .map(([k,v,d]) => '<tr><td style="color:#0cf">?' + k + '=</td><td>' + v + '</td><td style="color:#888">default: ' + d + '</td></tr>').join('') +
-    '</table><p style="margin-top:12px;color:#888">Any input exits screensaver.</p>';
+    '</table><p style="margin-top:12px;color:#888">Any key press exits screensaver.</p>';
   document.body.appendChild(div);
 }
 
@@ -1107,15 +1107,12 @@ window.addEventListener('resize', resize);
 resize();
 
 // Exit on any input
-function exitHandler(e) {
-  if (e.type === 'keydown' || e.type === 'mousemove' || e.type === 'click' || e.type === 'touchstart') {
-    window.close();
+  function exitHandler(e) {
+    if (e.type === 'keydown') {
+      window.close();
+    }
   }
-}
-window.addEventListener('keydown', exitHandler);
-window.addEventListener('mousemove', exitHandler);
-window.addEventListener('click', exitHandler);
-window.addEventListener('touchstart', exitHandler);
+  window.addEventListener('keydown', exitHandler);
 
 // ---- Background Generation ----
 
@@ -1806,20 +1803,14 @@ function drawLightRays(time) {
 
   for (let i = 0; i < count; i++) {
     const rx = w * (0.15 + i * 0.3) + Math.sin(time * 0.3 + i) * w * 0.1;
-    const alpha = 0.03 + Math.sin(time * 0.5 + i * 2) * 0.02;
+    const alpha = 0.04 + Math.sin(time * 0.5 + i * 2) * 0.015;
 
-    ctx.fillStyle = `rgba(255,255,255,${alpha})`;
-    const rayW = w * 0.04;
+    const grad = ctx.createLinearGradient(rx, 0, rx, h * 0.6);
+    grad.addColorStop(0, `rgba(255,255,255,${alpha})`);
+    grad.addColorStop(1, `rgba(255,255,255,0)`);
+    ctx.fillStyle = grad;
+    const rayW = w * 0.06;
     ctx.fillRect(rx - rayW / 2, 0, rayW, h * 0.6);
-
-    ctx.fillStyle = `rgba(255,255,255,${alpha * 0.5})`;
-    for (let j = 0; j < h * 0.5; j += 8) {
-      if (Math.floor(j / 8) % 2 === 0) {
-        ctx.fillRect(rx, j, 2, 4);
-      } else {
-        ctx.fillRect(rx + 4, j, 2, 4);
-      }
-    }
   }
 }
 
